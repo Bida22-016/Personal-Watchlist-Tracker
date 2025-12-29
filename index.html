@@ -1,0 +1,1528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Personal Movie & TV Watchlist</title>
+  <script src="https://cdn.jsdelivr.net/npm/@tailwindcss/browser@4"></script>
+  <style>
+    /* Custom scrollbar for dark theme */
+    ::-webkit-scrollbar {
+      width: 8px;
+      height: 8px;
+    }
+    ::-webkit-scrollbar-track {
+      background: rgba(15, 23, 42, 0.9);
+    }
+    ::-webkit-scrollbar-thumb {
+      background: rgba(148, 163, 184, 0.8);
+      border-radius: 9999px;
+    }
+    ::-webkit-scrollbar-thumb:hover {
+      background: rgba(249, 115, 22, 0.9);
+    }
+    .backdrop-blur-2xl {
+      backdrop-filter: blur(24px);
+    }
+  </style>
+</head>
+<body class="bg-slate-950 text-slate-100 min-h-screen">
+  <noscript>
+    <div class="p-4 bg-red-700 text-center text-white">
+      This application requires JavaScript to run. Please enable JavaScript in your browser.
+    </div>
+  </noscript>
+  <div id="root" class="min-h-screen"></div>
+
+  <!-- React and Babel -->
+  <script src="https://unpkg.com/react@18/umd/react.development.js" crossorigin></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.development.js" crossorigin></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+
+  <script type="text/babel" data-presets="env,react">
+    const { useState, useEffect, useMemo } = React;
+
+    // ======== TMDB configuration ========
+    const TMDB_API_KEY = 'REPLACE_WITH_YOUR_TMDB_API_KEY';
+    const TMDB_BASE_URL = 'https://api.themoviedb.org/3';
+    const TMDB_IMAGE_BASE = 'https://image.tmdb.org/t/p/';
+
+    function buildImageUrl(path, size = 'w342') {
+      if (!path) return null;
+      return TMDB_IMAGE_BASE + size + path;
+    }
+
+    async function fetchFromTMDB(path, params = {}) {
+      if (!TMDB_API_KEY || TMDB_API_KEY.startsWith('REPLACE_WITH')) {
+        throw new Error('TMDB API key is not configured. Edit index.html and set TMDB_API_KEY.');
+      }
+      const url = new URL(TMDB_BASE_URL + path);
+      const search = new URLSearchParams({
+        api_key: TMDB_API_KEY,
+        language: 'en-US',
+        ...params,
+      });
+      url.search = search.toString();
+      const response = await fetch(url.toString());
+      let data;
+      try {
+        data = await response.json();
+      } catch (e) {
+        data = null;
+      }
+      if (!response.ok) {
+        const message = (data && (data.status_message || data.message)) || response.statusText || 'Request failed';
+        throw new Error(message);
+      }
+      return data;
+    }
+
+    // ======== Helpers ========
+
+    function normalizeResults(results, forcedType = null) {
+      if (!Array.isArray(results)) return [];
+      return results
+        .filter(raw => {
+          const type = forcedType || raw.media_type || raw.type;
+          return type === 'movie' || type === 'tv';
+        })
+        .map(raw => {
+          const type = forcedType || raw.media_type || raw.type;
+          const title = type === 'movie'
+            ? (raw.title || raw.original_title || 'Untitled movie')
+            : (raw.name || raw.original_name || 'Untitled TV show');
+          const releaseDate = type === 'movie'
+            ? (raw.release_date || null)
+            : (raw.first_air_date || null);
+          const year = releaseDate ? parseInt(releaseDate.slice(0, 4), 10) : null;
+          const originCountry = raw.origin_country || [];
+          return {
+            id: raw.id,
+            type,
+            title,
+            releaseDate,
+            year,
+            originCountry,
+            genre_ids: raw.genre_ids || [],
+            voteAverage: typeof raw.vote_average === 'number' ? raw.vote_average : 0,
+            voteCount: typeof raw.vote_count === 'number' ? raw.vote_count : 0,
+            adult: !!raw.adult,
+            posterPath: raw.poster_path || null,
+            backdropPath: raw.backdrop_path || null,
+            overview: raw.overview || '',
+            runtime: null,
+            budget: null,
+            revenue: null,
+            certification: null,
+            detailLoaded: false,
+            detailError: null,
+          };
+        });
+    }
+
+    function extractCertification(raw, type, originCountryList) {
+      const countryPriority = [];
+      if (Array.isArray(originCountryList) && originCountryList.length > 0) {
+        countryPriority.push(originCountryList[0]);
+      }
+      countryPriority.push('US', 'GB', 'CA', 'AU');
+      const seen = new Set();
+      const priority = countryPriority.filter(code => {
+        if (!code) return false;
+        const upper = code.toUpperCase();
+        if (seen.has(upper)) return false;
+        seen.add(upper);
+        return true;
+      });
+
+      if (type === 'movie' && raw.release_dates && Array.isArray(raw.release_dates.results)) {
+        const results = raw.release_dates.results;
+        const findForCountry = (code) => {
+          const entry = results.find(r => r.iso_3166_1 === code);
+          if (!entry || !Array.isArray(entry.release_dates)) return null;
+          const withCert = entry.release_dates.filter(r => r.certification);
+          if (!withCert.length) return null;
+          let chosen = withCert.find(r => r.type === 3) || withCert.find(r => r.type === 2) || withCert[0];
+          return { code: chosen.certification, country: code };
+        };
+        for (const c of priority) {
+          const hit = findForCountry(c);
+          if (hit) return hit;
+        }
+        for (const entry of results) {
+          if (!Array.isArray(entry.release_dates)) continue;
+          const any = entry.release_dates.find(r => r.certification);
+          if (any) {
+            return { code: any.certification, country: entry.iso_3166_1 };
+          }
+        }
+      }
+
+      if (type === 'tv' && raw.content_ratings && Array.isArray(raw.content_ratings.results)) {
+        const results = raw.content_ratings.results;
+        const findForCountry = (code) => results.find(r => r.iso_3166_1 === code && r.rating);
+        for (const c of priority) {
+          const hit = findForCountry(c);
+          if (hit) return { code: hit.rating, country: c };
+        }
+        const any = results.find(r => r.rating);
+        if (any) {
+          return { code: any.rating, country: any.iso_3166_1 };
+        }
+      }
+
+      if (raw.adult) {
+        return { code: '18+', country: priority[0] || null };
+      }
+      return { code: 'NR', country: null };
+    }
+
+    function extractTrailerKey(raw) {
+      if (!raw.videos || !Array.isArray(raw.videos.results)) return null;
+      const videos = raw.videos.results.filter(v => v.site === 'YouTube');
+      if (!videos.length) return null;
+      const officialTrailer = videos.find(v => v.type === 'Trailer' && v.official);
+      if (officialTrailer) return officialTrailer.key;
+      const anyTrailer = videos.find(v => v.type === 'Trailer');
+      if (anyTrailer) return anyTrailer.key;
+      const teaser = videos.find(v => v.type === 'Teaser');
+      if (teaser) return teaser.key;
+      return videos[0].key;
+    }
+
+    function formatRuntime(minutes) {
+      if (!minutes || typeof minutes !== 'number') return 'Unknown';
+      const h = Math.floor(minutes / 60);
+      const m = minutes % 60;
+      if (!h) return `${m} min`;
+      if (!m) return `${h} h`;
+      return `${h} h ${m} min`;
+    }
+
+    function formatMoney(amount) {
+      if (!amount || typeof amount !== 'number') return 'Unknown';
+      try {
+        return new Intl.NumberFormat('en-US', {
+          style: 'currency',
+          currency: 'USD',
+          notation: 'compact',
+          maximumFractionDigits: 1,
+        }).format(amount);
+      } catch (e) {
+        return `$${amount.toLocaleString()}`;
+      }
+    }
+
+    function getCertificationStyle(certCode) {
+      const code = (certCode || '').toUpperCase();
+      if (!code || code === 'NR') {
+        return { label: 'NR', className: 'bg-slate-600 text-slate-50' };
+      }
+      if (['G', 'TV-Y', 'TV-G', 'U'].includes(code)) {
+        return { label: code, className: 'bg-emerald-500 text-emerald-950' };
+      }
+      if (['PG', 'PG-13', 'TV-PG', 'TV-Y7', '12', '12A', '6', '7+'].includes(code)) {
+        return { label: code, className: 'bg-yellow-400 text-yellow-950' };
+      }
+      if (['R', 'NC-17', 'TV-14', 'TV-MA', '18', '18+', '16'].includes(code)) {
+        return { label: code, className: 'bg-red-500 text-red-50' };
+      }
+      return { label: code, className: 'bg-slate-300 text-slate-900' };
+    }
+
+    function getItemKey(item) {
+      return item ? `${item.type}_${item.id}` : '';
+    }
+
+    const WATCH_STATUSES = [
+      { id: 'watching', label: 'Watching' },
+      { id: 'onHold', label: 'On-Hold' },
+      { id: 'plan', label: 'Plan to Watch' },
+      { id: 'dropped', label: 'Dropped' },
+      { id: 'completed', label: 'Completed' },
+    ];
+
+    function loadWatchlistFromStorage() {
+      try {
+        const raw = localStorage.getItem('watchlist_v1');
+        if (!raw) return {};
+        const parsed = JSON.parse(raw);
+        if (!parsed || typeof parsed !== 'object') return {};
+        return parsed;
+      } catch (e) {
+        console.warn('Failed to parse watchlist from storage', e);
+        return {};
+      }
+    }
+
+    // ======== UI Components ========
+
+    function StatusSelector({ status, onChange }) {
+      return (
+        <select
+          value={status || ''}
+          onChange={e => onChange(e.target.value || null)}
+          className="w-full text-xs rounded-md bg-slate-800 border border-slate-700 px-2 py-1 text-slate-100 focus:outline-none focus:ring-2 focus:ring-orange-500"
+        >
+          <option value="">No status</option>
+          {WATCH_STATUSES.map(s => (
+            <option key={s.id} value={s.id}>{s.label}</option>
+          ))}
+        </select>
+      );
+    }
+
+    function ItemCard({ item, genreLookup, onOpenDetails, watchStatus, onChangeStatus }) {
+      const posterUrl = buildImageUrl(item.posterPath, 'w342');
+      const certification = item.certification || (item.adult ? { code: '18+', country: null } : { code: 'NR', country: null });
+      const certStyle = getCertificationStyle(certification.code);
+      const genreNames = (item.genre_ids || [])
+        .map(id => genreLookup[id])
+        .filter(Boolean)
+        .slice(0, 3);
+
+      return (
+        <div className="group flex flex-col rounded-xl bg-slate-900/70 border border-slate-800 hover:border-orange-500/80 hover:shadow-xl hover:shadow-orange-500/10 overflow-hidden transition">
+          <button
+            type="button"
+            onClick={() => onOpenDetails(item)}
+            className="relative w-full aspect-[2/3] bg-slate-800 overflow-hidden"
+          >
+            {posterUrl ? (
+              <img
+                src={posterUrl}
+                alt={item.title}
+                loading="lazy"
+                className="h-full w-full object-cover group-hover:scale-[1.03] transition-transform duration-300"
+              />
+            ) : (
+              <div className="flex h-full w-full items-center justify-center bg-gradient-to-br from-slate-700 to-slate-900 text-slate-300 text-xs p-4 text-center">
+                No poster available
+              </div>
+            )}
+            <div className="absolute top-2 left-2 flex flex-col gap-1">
+              <div className="inline-flex items-center gap-1 rounded-full bg-slate-900/80 px-2 py-0.5 text-[11px] font-medium text-slate-50">
+                <span className="text-yellow-300">★</span>
+                <span>{item.voteAverage ? item.voteAverage.toFixed(1) : 'N/A'}</span>
+                <span className="text-[10px] text-slate-300">({item.voteCount || 0})</span>
+              </div>
+              <div className={`inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[11px] font-semibold ${certStyle.className}`}>
+                <span>{certStyle.label}</span>
+              </div>
+            </div>
+            <div className="absolute top-2 right-2">
+              <span className="inline-flex items-center rounded-full bg-slate-900/80 px-2 py-0.5 text-[11px] font-semibold text-slate-100">
+                {item.type === 'movie' ? 'Movie' : 'TV'}
+              </span>
+            </div>
+          </button>
+
+          <div className="flex flex-col gap-2 p-3 sm:p-3.5">
+            <div className="flex items-start justify-between gap-2">
+              <div className="min-w-0">
+                <h3
+                  className="truncate text-sm font-semibold text-slate-50"
+                  title={item.title}
+                >
+                  {item.title}
+                </h3>
+                <div className="mt-0.5 flex flex-wrap items-center gap-1 text-[11px] text-slate-400">
+                  {item.year && <span>{item.year}</span>}
+                  {item.originCountry && item.originCountry.length > 0 && (
+                    <>
+                      <span className="text-slate-600">•</span>
+                      <span>{item.originCountry.join(', ')}</span>
+                    </>
+                  )}
+                </div>
+              </div>
+            </div>
+
+            <div className="flex flex-wrap gap-1">
+              {genreNames.map(name => (
+                <span
+                  key={name}
+                  className="rounded-full bg-slate-800/90 px-2 py-0.5 text-[10px] text-slate-200"
+                >
+                  {name}
+                </span>
+              ))}
+              {genreNames.length === 0 && (
+                <span className="rounded-full bg-slate-800/90 px-2 py-0.5 text-[10px] text-slate-400">
+                  No genres
+                </span>
+              )}
+            </div>
+
+            <div className="mt-1 flex flex-col gap-2">
+              <div className="flex items-center gap-2">
+                {!watchStatus && (
+                  <button
+                    type="button"
+                    onClick={() => onChangeStatus('plan')}
+                    className="flex-1 rounded-md bg-orange-500 px-2.5 py-1 text-[11px] font-semibold text-slate-950 hover:bg-orange-400 transition"
+                  >
+                    Add to Plan to Watch
+                  </button>
+                )}
+                {watchStatus && (
+                  <span className="inline-flex items-center rounded-md bg-emerald-500/10 px-2 py-1 text-[11px] font-medium text-emerald-300 border border-emerald-500/40">
+                    In watchlist: {WATCH_STATUSES.find(s => s.id === watchStatus)?.label || 'Unknown'}
+                  </span>
+                )}
+              </div>
+              <StatusSelector status={watchStatus} onChange={onChangeStatus} />
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function DetailModal({ item, onClose, loading, error }) {
+      if (!item) return null;
+
+      const posterUrl = buildImageUrl(item.posterPath, 'w500');
+      const backdropUrl = buildImageUrl(item.backdropPath, 'w1280');
+      const certification = item.certification || (item.adult ? { code: '18+', country: null } : { code: 'NR', country: null });
+      const certStyle = getCertificationStyle(certification.code);
+      const runtimeLabel = item.runtime ? formatRuntime(item.runtime) : (item.type === 'tv' ? 'Per episode: Unknown' : 'Unknown');
+      const budgetLabel = item.type === 'movie' ? formatMoney(item.budget) : 'N/A';
+      const revenueLabel = item.type === 'movie' ? formatMoney(item.revenue) : 'N/A';
+      const genres = (item.genresFull || []).map(g => g.name).filter(Boolean);
+      const countryLabel = Array.isArray(item.originCountry) && item.originCountry.length
+        ? item.originCountry.join(', ')
+        : 'Unknown';
+
+      return (
+        <div className="fixed inset-0 z-40 flex items-start justify-center overflow-y-auto bg-black/80 py-8 px-4 sm:px-6">
+          <div className="relative w-full max-w-5xl rounded-2xl bg-slate-950/95 border border-slate-800 shadow-2xl shadow-black/60 backdrop-blur-2xl">
+            <button
+              type="button"
+              onClick={onClose}
+              className="absolute right-4 top-4 inline-flex h-8 w-8 items-center justify-center rounded-full bg-slate-900/80 text-slate-200 hover:bg-slate-800 focus:outline-none focus:ring-2 focus:ring-orange-500"
+            >
+              ✕
+            </button>
+
+            <div className="relative">
+              {backdropUrl ? (
+                <div className="h-48 w-full overflow-hidden rounded-t-2xl bg-slate-900 sm:h-56 md:h-64">
+                  <img
+                    src={backdropUrl}
+                    alt={item.title}
+                    className="h-full w-full object-cover opacity-60"
+                  />
+                </div>
+              ) : (
+                <div className="h-40 w-full rounded-t-2xl bg-gradient-to-r from-slate-900 via-slate-800 to-slate-900" />
+              )}
+              <div className="absolute inset-0 bg-gradient-to-t from-slate-950 via-slate-950/80 to-slate-950/10 rounded-t-2xl" />
+            </div>
+
+            <div className="relative -mt-16 px-4 pb-5 sm:px-6 md:px-8 md:pb-8">
+              <div className="grid gap-6 md:grid-cols-[minmax(0,2fr)_minmax(0,3fr)]">
+                <div className="flex flex-col gap-4">
+                  <div className="relative w-40 sm:w-48 md:w-56 -mt-4">
+                    <div className="overflow-hidden rounded-2xl border border-slate-800 bg-slate-900 shadow-xl shadow-black/60">
+                      {posterUrl ? (
+                        <img
+                          src={posterUrl}
+                          alt={item.title}
+                          className="w-full"
+                        />
+                      ) : (
+                        <div className="flex aspect-[2/3] items-center justify-center bg-gradient-to-br from-slate-800 to-slate-900 text-slate-300 text-sm p-4 text-center">
+                          No poster available
+                        </div>
+                      )}
+                    </div>
+                  </div>
+
+                  <div className="flex flex-col gap-2 text-sm text-slate-200">
+                    <div className="flex flex-wrap items-center gap-2">
+                      <span className={`inline-flex items-center gap-1 rounded-full px-3 py-1 text-xs font-semibold ${certStyle.className}`}>
+                        <span>{certStyle.label}</span>
+                        {certification.country && (
+                          <span className="text-[10px] opacity-80">({certification.country})</span>
+                        )}
+                      </span>
+                      <span className="inline-flex items-center rounded-full bg-slate-800 px-3 py-1 text-xs font-medium text-slate-200">
+                        {item.type === 'movie' ? 'Movie' : 'TV Series'}
+                      </span>
+                      {item.year && (
+                        <span className="inline-flex items-center rounded-full bg-slate-800 px-3 py-1 text-xs text-slate-200">
+                          {item.year}
+                        </span>
+                      )}
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-3 text-xs sm:text-[13px]">
+                      <div className="space-y-1">
+                        <div className="text-slate-400">Runtime</div>
+                        <div className="font-medium text-slate-100">{runtimeLabel}</div>
+                      </div>
+                      <div className="space-y-1">
+                        <div className="text-slate-400">Country</div>
+                        <div className="font-medium text-slate-100">{countryLabel}</div>
+                      </div>
+                      <div className="space-y-1">
+                        <div className="text-slate-400">TMDB Rating</div>
+                        <div className="flex items-center gap-1 font-medium text-slate-100">
+                          <span className="text-yellow-300">★</span>
+                          <span>{item.voteAverage ? item.voteAverage.toFixed(1) : 'N/A'}</span>
+                          <span className="text-xs text-slate-400">({item.voteCount || 0} votes)</span>
+                        </div>
+                      </div>
+                      <div className="space-y-1">
+                        <div className="text-slate-400">Release Year</div>
+                        <div className="font-medium text-slate-100">{item.year || 'Unknown'}</div>
+                      </div>
+                      <div className="space-y-1">
+                        <div className="text-slate-400">Budget (movies)</div>
+                        <div className="font-medium text-slate-100">{budgetLabel}</div>
+                      </div>
+                      <div className="space-y-1">
+                        <div className="text-slate-400">Lifetime Gross (movies)</div>
+                        <div className="font-medium text-slate-100">{revenueLabel}</div>
+                      </div>
+                    </div>
+
+                    {genres.length > 0 && (
+                      <div className="mt-1">
+                        <div className="text-xs text-slate-400 mb-1">Genres</div>
+                        <div className="flex flex-wrap gap-1.5">
+                          {genres.map(name => (
+                            <span
+                              key={name}
+                              className="rounded-full bg-slate-800 px-2.5 py-0.5 text-[11px] text-slate-100"
+                            >
+                              {name}
+                            </span>
+                          ))}
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="flex flex-col gap-4">
+                  <div>
+                    <h2 className="text-xl sm:text-2xl font-semibold text-slate-50">
+                      {item.title}
+                    </h2>
+                  </div>
+
+                  <div className="space-y-2 text-sm leading-relaxed text-slate-200 max-h-52 overflow-y-auto pr-1">
+                    <div className="text-xs font-semibold uppercase tracking-wide text-slate-400">
+                      Synopsis
+                    </div>
+                    <p>
+                      {item.overview || 'No overview available for this title.'}
+                    </p>
+                  </div>
+
+                  <div className="mt-2">
+                    <div className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-2">
+                      Trailer
+                    </div>
+                    {loading && !item.detailLoaded && (
+                      <div className="flex h-48 items-center justify-center rounded-xl border border-slate-800 bg-slate-900 text-sm text-slate-300">
+                        Loading trailer and details...
+                      </div>
+                    )}
+                    {error && (
+                      <div className="rounded-xl border border-red-500/70 bg-red-950/40 px-3 py-2 text-xs text-red-200">
+                        {error}
+                      </div>
+                    )}
+                    {!loading && item.trailerKey && (
+                      <div className="aspect-video w-full overflow-hidden rounded-xl border border-slate-800 bg-black">
+                        <iframe
+                          src={`https://www.youtube.com/embed/${item.trailerKey}`}
+                          title={`${item.title} trailer`}
+                          allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+                          allowFullScreen
+                          className="h-full w-full"
+                          loading="lazy"
+                        />
+                      </div>
+                    )}
+                    {!loading && !item.trailerKey && !error && (
+                      <div className="flex h-40 items-center justify-center rounded-xl border border-slate-800 bg-slate-900 text-sm text-slate-300">
+                        No trailer available for this title.
+                      </div>
+                    )}
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      );
+    }
+
+    function FiltersPanel({
+      genres,
+      filters,
+      onUpdateFilters,
+      contentType,
+      onChangeContentType,
+      browseMode,
+      onChangeBrowseMode,
+      availableCountries,
+      onClearFilters,
+    }) {
+      const [open, setOpen] = useState(true);
+
+      const handleCheckboxGenre = (id) => {
+        const current = filters.selectedGenres || [];
+        if (current.includes(id)) {
+          onUpdateFilters({ selectedGenres: current.filter(x => x !== id) });
+        } else {
+          onUpdateFilters({ selectedGenres: [...current, id] });
+        }
+      };
+
+      const handleNumericChange = (key, value) => {
+        const trimmed = value.trim();
+        if (!trimmed) {
+          onUpdateFilters({ [key]: '' });
+        } else {
+          const num = Number(trimmed);
+          if (!Number.isNaN(num)) {
+            onUpdateFilters({ [key]: num });
+          }
+        }
+      };
+
+      return (
+        <div className="space-y-3">
+          <div className="rounded-xl border border-slate-800 bg-slate-900/80 p-3 sm:p-4">
+            <div className="mb-3">
+              <div className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-1">
+                Content type
+              </div>
+              <div className="inline-flex rounded-lg bg-slate-800 p-0.5 text-xs">
+                {[
+                  { id: 'all', label: 'All' },
+                  { id: 'movie', label: 'Movies' },
+                  { id: 'tv', label: 'TV Shows' },
+                ].map(opt => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => onChangeContentType(opt.id)}
+                    className={
+                      'px-2.5 py-1 rounded-md font-medium transition ' +
+                      (contentType === opt.id
+                        ? 'bg-orange-500 text-slate-950 shadow-sm'
+                        : 'text-slate-200 hover:bg-slate-700')
+                    }
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+
+            <div>
+              <div className="text-xs font-semibold uppercase tracking-wide text-slate-400 mb-1">
+                Browse mode
+              </div>
+              <div className="inline-flex rounded-lg bg-slate-800 p-0.5 text-xs">
+                {[
+                  { id: 'popular', label: 'Popular / Trending' },
+                  { id: 'upcoming', label: 'Upcoming' },
+                ].map(opt => (
+                  <button
+                    key={opt.id}
+                    type="button"
+                    onClick={() => onChangeBrowseMode(opt.id)}
+                    className={
+                      'px-2.5 py-1 rounded-md font-medium transition text-[11px] ' +
+                      (browseMode === opt.id
+                        ? 'bg-emerald-500 text-emerald-950 shadow-sm'
+                        : 'text-slate-200 hover:bg-slate-700')
+                    }
+                  >
+                    {opt.label}
+                  </button>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <div className="rounded-xl border border-slate-800 bg-slate-900/80">
+            <button
+              type="button"
+              onClick={() => setOpen(o => !o)}
+              className="flex w-full items-center justify-between px-3 py-2.5 text-xs font-semibold uppercase tracking-wide text-slate-300 hover:bg-slate-800/80"
+            >
+              <span>Advanced filters</span>
+              <span className="text-slate-400">
+                {open ? 'Hide' : 'Show'}
+              </span>
+            </button>
+            {open && (
+              <div className="border-t border-slate-800 px-3 py-3 space-y-3 text-xs">
+                <div className="space-y-2">
+                  <div className="font-semibold text-slate-300">Genres</div>
+                  <div className="grid grid-cols-2 gap-1.5">
+                    {genres.map(g => (
+                      <label key={g.id} className="inline-flex items-center gap-1.5 text-[11px] text-slate-200">
+                        <input
+                          type="checkbox"
+                          className="h-3.5 w-3.5 rounded border-slate-600 bg-slate-900 text-orange-500 focus:ring-orange-500"
+                          checked={filters.selectedGenres?.includes(g.id) || false}
+                          onChange={() => handleCheckboxGenre(g.id)}
+                        />
+                        <span>{g.name}</span>
+                      </label>
+                    ))}
+                    {genres.length === 0 && (
+                      <div className="text-[11px] text-slate-400">
+                        Genres will appear once the API configuration is valid.
+                      </div>
+                    )}
+                  </div>
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-1.5">
+                    <div className="font-semibold text-slate-300">Rating (0–10)</div>
+                    <div className="flex items-center gap-1">
+                      <input
+                        type="number"
+                        min="0"
+                        max="10"
+                        step="0.5"
+                        value={filters.ratingMin === '' ? '' : filters.ratingMin}
+                        onChange={e => handleNumericChange('ratingMin', e.target.value)}
+                        className="w-16 rounded-md border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[11px] text-slate-100 focus:outline-none focus:ring-1 focus:ring-orange-500"
+                        placeholder="Min"
+                      />
+                      <span className="text-slate-500 text-[11px]">to</span>
+                      <input
+                        type="number"
+                        min="0"
+                        max="10"
+                        step="0.5"
+                        value={filters.ratingMax === '' ? '' : filters.ratingMax}
+                        onChange={e => handleNumericChange('ratingMax', e.target.value)}
+                        className="w-16 rounded-md border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[11px] text-slate-100 focus:outline-none focus:ring-1 focus:ring-orange-500"
+                        placeholder="Max"
+                      />
+                    </div>
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <div className="font-semibold text-slate-300">Release year</div>
+                    <div className="flex items-center gap-1">
+                      <input
+                        type="number"
+                        value={filters.yearMin === '' ? '' : filters.yearMin}
+                        onChange={e => handleNumericChange('yearMin', e.target.value)}
+                        className="w-20 rounded-md border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[11px] text-slate-100 focus:outline-none focus:ring-1 focus:ring-orange-500"
+                        placeholder="From"
+                      />
+                      <span className="text-slate-500 text-[11px]">to</span>
+                      <input
+                        type="number"
+                        value={filters.yearMax === '' ? '' : filters.yearMax}
+                        onChange={e => handleNumericChange('yearMax', e.target.value)}
+                        className="w-20 rounded-md border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[11px] text-slate-100 focus:outline-none focus:ring-1 focus:ring-orange-500"
+                        placeholder="To"
+                      />
+                    </div>
+                  </div>
+                </div>
+
+                <div className="space-y-1.5">
+                  <div className="font-semibold text-slate-300">Country (ISO code)</div>
+                  <input
+                    type="text"
+                    maxLength={2}
+                    value={filters.country}
+                    onChange={e => onUpdateFilters({ country: e.target.value.toUpperCase() })}
+                    className="w-20 rounded-md border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[11px] text-slate-100 focus:outline-none focus:ring-1 focus:ring-orange-500"
+                    placeholder="e.g. US"
+                  />
+                  {availableCountries && availableCountries.length > 0 && (
+                    <div className="mt-1 text-[10px] text-slate-400">
+                      Available in current results: {availableCountries.slice(0, 10).join(', ')}
+                      {availableCountries.length > 10 && '…'}
+                    </div>
+                  )}
+                </div>
+
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="space-y-1.5">
+                    <div className="font-semibold text-slate-300">Budget (movies)</div>
+                    <div className="flex items-center gap-1">
+                      <input
+                        type="number"
+                        min="0"
+                        step="1000000"
+                        value={filters.budgetMin === '' ? '' : filters.budgetMin}
+                        onChange={e => handleNumericChange('budgetMin', e.target.value)}
+                        className="w-full rounded-md border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[11px] text-slate-100 focus:outline-none focus:ring-1 focus:ring-orange-500"
+                        placeholder="Min ($)"
+                      />
+                    </div>
+                    <input
+                      type="number"
+                      min="0"
+                      step="1000000"
+                      value={filters.budgetMax === '' ? '' : filters.budgetMax}
+                      onChange={e => handleNumericChange('budgetMax', e.target.value)}
+                      className="w-full rounded-md border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[11px] text-slate-100 focus:outline-none focus:ring-1 focus:ring-orange-500"
+                      placeholder="Max ($)"
+                    />
+                  </div>
+
+                  <div className="space-y-1.5">
+                    <div className="font-semibold text-slate-300">Lifetime gross (movies)</div>
+                    <div className="flex items-center gap-1">
+                      <input
+                        type="number"
+                        min="0"
+                        step="1000000"
+                        value={filters.revenueMin === '' ? '' : filters.revenueMin}
+                        onChange={e => handleNumericChange('revenueMin', e.target.value)}
+                        className="w-full rounded-md border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[11px] text-slate-100 focus:outline-none focus:ring-1 focus:ring-orange-500"
+                        placeholder="Min ($)"
+                      />
+                    </div>
+                    <input
+                      type="number"
+                      min="0"
+                      step="1000000"
+                      value={filters.revenueMax === '' ? '' : filters.revenueMax}
+                      onChange={e => handleNumericChange('revenueMax', e.target.value)}
+                      className="w-full rounded-md border border-slate-700 bg-slate-900 px-1.5 py-0.5 text-[11px] text-slate-100 focus:outline-none focus:ring-1 focus:ring-orange-500"
+                      placeholder="Max ($)"
+                    />
+                  </div>
+                </div>
+
+                {(filters.budgetMin || filters.budgetMax || filters.revenueMin || filters.revenueMax) && (
+                  <div className="rounded-lg bg-amber-900/40 border border-amber-500/60 px-2.5 py-1.5 text-[11px] text-amber-100">
+                    Budget and lifetime gross filters apply to movies only. Titles without this data will be hidden while these filters are active.
+                  </div>
+                )}
+
+                <div className="pt-1">
+                  <button
+                    type="button"
+                    onClick={onClearFilters}
+                    className="w-full rounded-md border border-slate-700 bg-slate-900 px-2 py-1 text-[11px] font-medium text-slate-200 hover:bg-slate-800/80"
+                  >
+                    Clear all filters
+                  </button>
+                </div>
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
+
+    function Header({
+      viewMode,
+      onChangeViewMode,
+      searchQuery,
+      onSearchChange,
+      onSubmitSearch,
+      onClearSearch,
+      watchlistCounts,
+    }) {
+      const handleSubmit = (e) => {
+        e.preventDefault();
+        onSubmitSearch();
+      };
+
+      const totalWatchlist = Object.values(watchlistCounts || {}).reduce((sum, val) => sum + (val || 0), 0);
+
+      return (
+        <header className="border-b border-slate-800 bg-slate-950/90 backdrop-blur-2xl sticky top-0 z-30">
+          <div className="mx-auto max-w-7xl px-3 sm:px-4 lg:px-6 py-3 sm:py-3.5 flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+            <div className="flex items-center gap-2 sm:gap-3">
+              <div className="flex h-9 w-9 items-center justify-center rounded-xl bg-gradient-to-br from-orange-500 via-pink-500 to-indigo-500 text-slate-950 font-bold text-lg shadow-lg shadow-orange-500/40">
+                ◼
+              </div>
+              <div>
+                <h1 className="text-base sm:text-lg font-semibold text-slate-50">
+                  Personal Watchlist & Tracker
+                </h1>
+                <p className="text-[11px] text-slate-400">
+                  Private movie & TV library with filters, trailers, and watch statuses.
+                </p>
+              </div>
+            </div>
+
+            <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:gap-3">
+              <div className="flex items-center gap-1.5 rounded-full bg-slate-900 border border-slate-800 p-0.5 text-[11px]">
+                <button
+                  type="button"
+                  onClick={() => onChangeViewMode('browse')}
+                  className={
+                    'px-2.5 py-1 rounded-full font-medium transition ' +
+                    (viewMode === 'browse'
+                      ? 'bg-slate-100 text-slate-950 shadow-sm'
+                      : 'text-slate-200 hover:bg-slate-800')
+                  }
+                >
+                  Discover
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onChangeViewMode('watchlist')}
+                  className={
+                    'px-2.5 py-1 rounded-full font-medium transition inline-flex items-center gap-1 ' +
+                    (viewMode === 'watchlist'
+                      ? 'bg-slate-100 text-slate-950 shadow-sm'
+                      : 'text-slate-200 hover:bg-slate-800')
+                  }
+                >
+                  Watchlist
+                  <span className="ml-0.5 inline-flex min-w-[1.25rem] items-center justify-center rounded-full bg-slate-900 px-1 text-[10px] font-semibold text-slate-100">
+                    {totalWatchlist}
+                  </span>
+                </button>
+              </div>
+
+              <form onSubmit={handleSubmit} className="flex items-center gap-1.5 rounded-full bg-slate-900 border border-slate-800 px-2 py-0.5 w-full sm:w-80">
+                <input
+                  type="text"
+                  value={searchQuery}
+                  onChange={e => onSearchChange(e.target.value)}
+                  placeholder="Search by title (press Enter to run search)"
+                  className="flex-1 bg-transparent px-1.5 py-1 text-xs text-slate-100 placeholder:text-slate-500 focus:outline-none"
+                />
+                {searchQuery && (
+                  <button
+                    type="button"
+                    onClick={onClearSearch}
+                    className="rounded-full px-1 text-xs text-slate-400 hover:text-slate-200"
+                  >
+                    Clear
+                  </button>
+                )}
+                <button
+                  type="submit"
+                  className="rounded-full bg-orange-500 px-2 py-1 text-[11px] font-semibold text-slate-950 hover:bg-orange-400 transition"
+                >
+                  Search
+                </button>
+              </form>
+            </div>
+          </div>
+        </header>
+      );
+    }
+
+    function WatchlistView({ watchlist, genreLookup, onOpenDetails, onChangeStatus }) {
+      const categories = WATCH_STATUSES.reduce((acc, s) => {
+        acc[s.id] = [];
+        return acc;
+      }, {});
+
+      Object.values(watchlist || {}).forEach(entry => {
+        if (entry && categories[entry.status]) {
+          categories[entry.status].push(entry);
+        }
+      });
+
+      return (
+        <div className="space-y-5">
+          {WATCH_STATUSES.map(cat => {
+            const items = categories[cat.id] || [];
+            return (
+              <section key={cat.id}>
+                <div className="mb-2 flex items-baseline justify-between">
+                  <h2 className="text-sm font-semibold text-slate-100">
+                    {cat.label}
+                  </h2>
+                  <span className="text-xs text-slate-400">
+                    {items.length} title{items.length === 1 ? '' : 's'}
+                  </span>
+                </div>
+                {items.length === 0 ? (
+                  <div className="rounded-xl border border-dashed border-slate-800 bg-slate-900/60 px-3 py-4 text-xs text-slate-400">
+                    No titles in this category yet.
+                  </div>
+                ) : (
+                  <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
+                    {items.map(entry => (
+                      <ItemCard
+                        key={getItemKey(entry)}
+                        item={entry}
+                        genreLookup={genreLookup}
+                        onOpenDetails={onOpenDetails}
+                        watchStatus={entry.status}
+                        onChangeStatus={status => onChangeStatus(entry, status)}
+                      />
+                    ))}
+                  </div>
+                )}
+              </section>
+            );
+          })}
+        </div>
+      );
+    }
+
+    function BrowseGrid({
+      items,
+      genreLookup,
+      watchlist,
+      onChangeStatus,
+      onOpenDetails,
+      loading,
+      error,
+    }) {
+      const hasResults = items && items.length > 0;
+
+      if (loading && !hasResults) {
+        return (
+          <div className="flex min-h-[200px] items-center justify-center text-sm text-slate-300">
+            Loading titles from TMDB…
+          </div>
+        );
+      }
+
+      if (error && !hasResults) {
+        return (
+          <div className="rounded-xl border border-red-500/70 bg-red-950/40 px-4 py-3 text-sm text-red-100">
+            {error}
+          </div>
+        );
+      }
+
+      if (!hasResults) {
+        return (
+          <div className="rounded-xl border border-slate-800 bg-slate-900/70 px-4 py-4 text-sm text-slate-300">
+            No titles found for the current filters and search. Try adjusting your filters or search term.
+          </div>
+        );
+      }
+
+      return (
+        <>
+          {error && (
+            <div className="mb-3 rounded-lg border border-amber-500/70 bg-amber-950/40 px-3 py-2 text-xs text-amber-100">
+              {error}
+            </div>
+          )}
+          <div className="grid grid-cols-2 gap-3 sm:grid-cols-3 md:grid-cols-4 lg:grid-cols-5">
+            {items.map(item => {
+              const key = getItemKey(item);
+              const status = watchlist[key]?.status || null;
+              return (
+                <ItemCard
+                  key={key}
+                  item={item}
+                  genreLookup={genreLookup}
+                  onOpenDetails={onOpenDetails}
+                  watchStatus={status}
+                  onChangeStatus={newStatus => onChangeStatus(item, newStatus)}
+                />
+              );
+            })}
+          </div>
+        </>
+      );
+    }
+
+    function App() {
+      const [items, setItems] = useState([]);
+      const [loading, setLoading] = useState(false);
+      const [error, setError] = useState(null);
+
+      const [searchQuery, setSearchQuery] = useState('');
+      const [pendingSearch, setPendingSearch] = useState('');
+      const [browseMode, setBrowseMode] = useState('popular'); // 'popular' | 'upcoming'
+      const [contentType, setContentType] = useState('all'); // 'all' | 'movie' | 'tv'
+      const [viewMode, setViewMode] = useState('browse');
+
+      const [genres, setGenres] = useState({ movie: [], tv: [], combined: [] });
+      const [filters, setFilters] = useState({
+        selectedGenres: [],
+        ratingMin: '',
+        ratingMax: '',
+        yearMin: '',
+        yearMax: '',
+        country: '',
+        budgetMin: '',
+        budgetMax: '',
+        revenueMin: '',
+        revenueMax: '',
+      });
+
+      const [watchlist, setWatchlist] = useState(() => loadWatchlistFromStorage());
+      const [selectedItem, setSelectedItem] = useState(null);
+      const [detailLoading, setDetailLoading] = useState(false);
+      const [detailError, setDetailError] = useState(null);
+
+      const apiKeyMissing = !TMDB_API_KEY || TMDB_API_KEY.startsWith('REPLACE_WITH');
+
+      useEffect(() => {
+        (async () => {
+          try {
+            const [movieGenres, tvGenres] = await Promise.all([
+              fetchFromTMDB('/genre/movie/list').then(d => d.genres || []).catch(() => []),
+              fetchFromTMDB('/genre/tv/list').then(d => d.genres || []).catch(() => []),
+            ]);
+            const map = {};
+            movieGenres.forEach(g => {
+              map[g.id] = { id: g.id, name: g.name, movie: true, tv: false };
+            });
+            tvGenres.forEach(g => {
+              if (map[g.id]) {
+                map[g.id].tv = true;
+              } else {
+                map[g.id] = { id: g.id, name: g.name, movie: false, tv: true };
+              }
+            });
+            const combined = Object.values(map).sort((a, b) => a.name.localeCompare(b.name));
+            setGenres({ movie: movieGenres, tv: tvGenres, combined });
+          } catch (e) {
+            console.warn('Failed to load genres', e);
+          }
+        })();
+      }, []);
+
+      useEffect(() => {
+        if (apiKeyMissing) return;
+        fetchItems({ reset: true });
+        // eslint-disable-next-line react-hooks/exhaustive-deps
+      }, [browseMode, contentType]);
+
+      useEffect(() => {
+        try {
+          localStorage.setItem('watchlist_v1', JSON.stringify(watchlist));
+        } catch (e) {
+          console.warn('Failed to persist watchlist', e);
+        }
+      }, [watchlist]);
+
+      const genreLookup = useMemo(() => {
+        const map = {};
+        (genres.combined || []).forEach(g => {
+          map[g.id] = g.name;
+        });
+        return map;
+      }, [genres]);
+
+      const availableCountries = useMemo(() => {
+        const set = new Set();
+        (items || []).forEach(item => {
+          if (Array.isArray(item.originCountry)) {
+            item.originCountry.forEach(c => {
+              if (c) set.add(c.toUpperCase());
+            });
+          }
+        });
+        return Array.from(set).sort();
+      }, [items]);
+
+      const updateFilters = (patch) => {
+        setFilters(prev => ({ ...prev, ...patch }));
+      };
+
+      const clearFilters = () => {
+        setFilters({
+          selectedGenres: [],
+          ratingMin: '',
+          ratingMax: '',
+          yearMin: '',
+          yearMax: '',
+          country: '',
+          budgetMin: '',
+          budgetMax: '',
+          revenueMin: '',
+          revenueMax: '',
+        });
+      };
+
+      const handleSearchSubmit = () => {
+        setSearchQuery(pendingSearch.trim());
+        fetchItems({ reset: true, queryOverride: pendingSearch.trim() });
+      };
+
+      const handleClearSearch = () => {
+        setPendingSearch('');
+        setSearchQuery('');
+        fetchItems({ reset: true, queryOverride: '' });
+      };
+
+      async function fetchItems({ reset = false, queryOverride = null } = {}) {
+        if (apiKeyMissing) {
+          setError('TMDB API key is not configured. Open index.html and set TMDB_API_KEY to your key from themoviedb.org.');
+          return;
+        }
+        setLoading(true);
+        setError(null);
+        const query = queryOverride !== null ? queryOverride : searchQuery;
+        try {
+          let results = [];
+          if (query) {
+            if (contentType === 'all') {
+              const data = await fetchFromTMDB('/search/multi', {
+                query,
+                include_adult: false,
+              });
+              results = (data.results || []).filter(r => r.media_type === 'movie' || r.media_type === 'tv');
+            } else if (contentType === 'movie') {
+              const data = await fetchFromTMDB('/search/movie', {
+                query,
+                include_adult: false,
+              });
+              results = data.results || [];
+            } else {
+              const data = await fetchFromTMDB('/search/tv', {
+                query,
+              });
+              results = data.results || [];
+            }
+          } else {
+            if (browseMode === 'popular') {
+              if (contentType === 'all') {
+                const data = await fetchFromTMDB('/trending/all/week', {});
+                results = data.results || [];
+              } else if (contentType === 'movie') {
+                const data = await fetchFromTMDB('/discover/movie', {
+                  sort_by: 'popularity.desc',
+                  include_adult: false,
+                });
+                results = data.results || [];
+              } else {
+                const data = await fetchFromTMDB('/discover/tv', {
+                  sort_by: 'popularity.desc',
+                });
+                results = data.results || [];
+              }
+            } else {
+              if (contentType === 'all') {
+                const [movie, tv] = await Promise.all([
+                  fetchFromTMDB('/movie/upcoming', { region: 'US' }).catch(() => ({ results: [] })),
+                  fetchFromTMDB('/tv/on_the_air', { }).catch(() => ({ results: [] })),
+                ]);
+                const m = (movie.results || []).map(r => ({ ...r, media_type: 'movie' }));
+                const t = (tv.results || []).map(r => ({ ...r, media_type: 'tv' }));
+                results = [...m, ...t];
+              } else if (contentType === 'movie') {
+                const data = await fetchFromTMDB('/movie/upcoming', { region: 'US' });
+                results = data.results || [];
+              } else {
+                const data = await fetchFromTMDB('/tv/on_the_air', {});
+                results = data.results || [];
+              }
+            }
+          }
+          const normalized = normalizeResults(results, contentType === 'all' ? null : contentType);
+          setItems(normalized);
+        } catch (e) {
+          console.error(e);
+          setError(e.message || 'Failed to load titles from TMDB.');
+          if (reset) {
+            setItems([]);
+          }
+        } finally {
+          setLoading(false);
+        }
+      }
+
+      async function loadDetailsForItem(item) {
+        if (!item) return;
+        const key = getItemKey(item);
+        const alreadyDetailed = (selectedItem && getItemKey(selectedItem) === key && selectedItem.detailLoaded) ||
+          items.some(it => getItemKey(it) === key && it.detailLoaded) ||
+          (watchlist[key] && watchlist[key].detailLoaded);
+
+        if (alreadyDetailed) {
+          return;
+        }
+
+        setDetailLoading(true);
+        setDetailError(null);
+        try {
+          const path = item.type === 'movie' ? `/movie/${item.id}` : `/tv/${item.id}`;
+          const append = item.type === 'movie' ? 'release_dates,videos' : 'content_ratings,videos';
+          const raw = await fetchFromTMDB(path, { append_to_response: append });
+
+          const runtime = item.type === 'movie'
+            ? (typeof raw.runtime === 'number' ? raw.runtime : null)
+            : (Array.isArray(raw.episode_run_time) && raw.episode_run_time.length ? raw.episode_run_time[0] : null);
+          const budget = item.type === 'movie' ? (typeof raw.budget === 'number' ? raw.budget : null) : null;
+          const revenue = item.type === 'movie' ? (typeof raw.revenue === 'number' ? raw.revenue : null) : null;
+          const productionCountries = Array.isArray(raw.production_countries)
+            ? raw.production_countries.map(c => c.iso_3166_1).filter(Boolean)
+            : [];
+          const originCountry = productionCountries.length
+            ? productionCountries
+            : (Array.isArray(raw.origin_country) && raw.origin_country.length ? raw.origin_country : item.originCountry || []);
+
+          const certification = extractCertification(
+            {
+              ...raw,
+              release_dates: raw.release_dates,
+              content_ratings: raw.content_ratings,
+              adult: raw.adult,
+            },
+            item.type,
+            originCountry
+          );
+          const trailerKey = extractTrailerKey(raw);
+          const genresFull = Array.isArray(raw.genres) ? raw.genres : (item.genresFull || []);
+          const overview = raw.overview || item.overview;
+          const backdropPath = raw.backdrop_path || item.backdropPath;
+          const posterPath = raw.poster_path || item.posterPath;
+          const voteAverage = typeof raw.vote_average === 'number' ? raw.vote_average : item.voteAverage;
+          const voteCount = typeof raw.vote_count === 'number' ? raw.vote_count : item.voteCount;
+          const releaseDate = item.type === 'movie'
+            ? (raw.release_date || item.releaseDate)
+            : (raw.first_air_date || item.releaseDate);
+          const year = releaseDate ? parseInt(releaseDate.slice(0, 4), 10) : item.year;
+
+          const detailPatch = {
+            runtime,
+            budget,
+            revenue,
+            originCountry,
+            certification,
+            trailerKey,
+            genresFull,
+            overview,
+            backdropPath,
+            posterPath,
+            voteAverage,
+            voteCount,
+            releaseDate,
+            year,
+            detailLoaded: true,
+          };
+
+          setItems(prev =>
+            prev.map(it =>
+              getItemKey(it) === key ? { ...it, ...detailPatch } : it
+            )
+          );
+          setSelectedItem(prev =>
+            prev && getItemKey(prev) === key ? { ...prev, ...detailPatch } : prev
+          );
+          setWatchlist(prev => {
+            if (!prev[key]) return prev;
+            return {
+              ...prev,
+              [key]: { ...prev[key], ...detailPatch },
+            };
+          });
+        } catch (e) {
+          console.error(e);
+          setDetailError(e.message || 'Failed to load detailed metadata.');
+          setItems(prev =>
+            prev.map(it =>
+              getItemKey(it) === key ? { ...it, detailLoaded: false, detailError: e.message || 'Failed to load details.' } : it
+            )
+          );
+        } finally {
+          setDetailLoading(false);
+        }
+      }
+
+      const handleOpenDetails = (item) => {
+        setSelectedItem(item);
+        setDetailError(null);
+        if (!item.detailLoaded) {
+          loadDetailsForItem(item);
+        }
+      };
+
+      const handleChangeStatus = (item, status) => {
+        const key = getItemKey(item);
+        setWatchlist(prev => {
+          const next = { ...prev };
+          if (!status) {
+            delete next[key];
+            return next;
+          }
+          const existing = prev[key] || {};
+          next[key] = {
+            ...existing,
+            ...item,
+            status,
+            updatedAt: new Date().toISOString(),
+          };
+          return next;
+        });
+      };
+
+      const filteredItems = useMemo(() => {
+        return (items || []).filter(item => {
+          if (contentType !== 'all' && item.type !== contentType) return false;
+
+          const selectedGenres = filters.selectedGenres || [];
+          if (selectedGenres.length > 0) {
+            const ids = item.genre_ids || [];
+            const match = selectedGenres.every(id => ids.includes(id));
+            if (!match) return false;
+          }
+
+          if (filters.ratingMin !== '' && typeof filters.ratingMin === 'number') {
+            if (item.voteAverage < filters.ratingMin) return false;
+          }
+          if (filters.ratingMax !== '' && typeof filters.ratingMax === 'number') {
+            if (item.voteAverage > filters.ratingMax) return false;
+          }
+
+          const year = item.year;
+          if (filters.yearMin !== '' && typeof filters.yearMin === 'number' && year) {
+            if (year < filters.yearMin) return false;
+          }
+          if (filters.yearMax !== '' && typeof filters.yearMax === 'number' && year) {
+            if (year > filters.yearMax) return false;
+          }
+
+          if (filters.country) {
+            const countries = Array.isArray(item.originCountry) ? item.originCountry.map(c => c.toUpperCase()) : [];
+            if (!countries.includes(filters.country.toUpperCase())) return false;
+          }
+
+          const needBudgetRevenue =
+            filters.budgetMin !== '' ||
+            filters.budgetMax !== '' ||
+            filters.revenueMin !== '' ||
+            filters.revenueMax !== '';
+
+          if (needBudgetRevenue) {
+            if (item.type !== 'movie') return false;
+            if (typeof item.budget !== 'number' || typeof item.revenue !== 'number') return false;
+            if (filters.budgetMin !== '' && typeof filters.budgetMin === 'number') {
+              if (item.budget < filters.budgetMin) return false;
+            }
+            if (filters.budgetMax !== '' && typeof filters.budgetMax === 'number') {
+              if (item.budget > filters.budgetMax) return false;
+            }
+            if (filters.revenueMin !== '' && typeof filters.revenueMin === 'number') {
+              if (item.revenue < filters.revenueMin) return false;
+            }
+            if (filters.revenueMax !== '' && typeof filters.revenueMax === 'number') {
+              if (item.revenue > filters.revenueMax) return false;
+            }
+          }
+
+          return true;
+        });
+      }, [items, filters, contentType]);
+
+      const watchlistCounts = useMemo(() => {
+        const counts = {};
+        WATCH_STATUSES.forEach(s => { counts[s.id] = 0; });
+        Object.values(watchlist || {}).forEach(entry => {
+          if (entry && entry.status && counts.hasOwnProperty(entry.status)) {
+            counts[entry.status] += 1;
+          }
+        });
+        return counts;
+      }, [watchlist]);
+
+      return (
+        <div className="min-h-screen bg-slate-950 text-slate-100">
+          {apiKeyMissing && (
+            <div className="bg-red-700 text-red-50 text-xs text-center px-4 py-2">
+              TMDB API key is not configured. Open <code className="font-mono text-[11px]">index.html</code> and replace
+              <span className="mx-1 font-mono text-[11px]">TMDB_API_KEY</span>
+              with your personal key from themoviedb.org. No external server is required.
+            </div>
+          )}
+
+          <Header
+            viewMode={viewMode}
+            onChangeViewMode={setViewMode}
+            searchQuery={pendingSearch}
+            onSearchChange={setPendingSearch}
+            onSubmitSearch={handleSearchSubmit}
+            onClearSearch={handleClearSearch}
+            watchlistCounts={watchlistCounts}
+          />
+
+          <main className="mx-auto max-w-7xl px-3 sm:px-4 lg:px-6 py-4 sm:py-6 flex flex-col gap-4 sm:gap-6">
+            <div className="grid gap-4 lg:grid-cols-[minmax(0,260px)_minmax(0,1fr)]">
+              <aside className="order-2 lg:order-1">
+                <FiltersPanel
+                  genres={genres.combined || []}
+                  filters={filters}
+                  onUpdateFilters={updateFilters}
+                  contentType={contentType}
+                  onChangeContentType={setContentType}
+                  browseMode={browseMode}
+                  onChangeBrowseMode={mode => {
+                    setBrowseMode(mode);
+                    fetchItems({ reset: true, queryOverride: '' });
+                  }}
+                  availableCountries={availableCountries}
+                  onClearFilters={clearFilters}
+                />
+                <div className="mt-4 rounded-xl border border-slate-800 bg-slate-900/80 px-3 py-2 text-[11px] text-slate-400">
+                  <div className="font-semibold text-slate-300 text-xs mb-1">
+                    Data & trailers
+                  </div>
+                  <p>
+                    Metadata and trailers are fetched live from TMDB. This application is intended for private, single-user use only.
+                  </p>
+                  <p className="mt-1">
+                    Budget and lifetime gross values are shown for movies where TMDB provides this data.
+                  </p>
+                </div>
+              </aside>
+
+              <section className="order-1 lg:order-2 space-y-4">
+                {viewMode === 'browse' ? (
+                  <BrowseGrid
+                    items={filteredItems}
+                    genreLookup={genreLookup}
+                    watchlist={watchlist}
+                    onChangeStatus={handleChangeStatus}
+                    onOpenDetails={handleOpenDetails}
+                    loading={loading}
+                    error={error}
+                  />
+                ) : (
+                  <WatchlistView
+                    watchlist={watchlist}
+                    genreLookup={genreLookup}
+                    onOpenDetails={handleOpenDetails}
+                    onChangeStatus={handleChangeStatus}
+                  />
+                )}
+              </section>
+            </div>
+
+            <footer className="border-t border-slate-800 pt-3 mt-3 text-[11px] text-slate-500 flex flex-col sm:flex-row sm:items-center sm:justify-between gap-1">
+              <div>
+                This product uses the TMDB API but is not endorsed or certified by TMDB.
+              </div>
+              <div className="text-slate-500">
+                All data remains in your browser (single-user, private watchlist).
+              </div>
+            </footer>
+          </main>
+
+          <DetailModal
+            item={selectedItem}
+            onClose={() => {
+              setSelectedItem(null);
+              setDetailError(null);
+            }}
+            loading={detailLoading}
+            error={detailError}
+          />
+        </div>
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+  </script>
+</body>
+</html>
